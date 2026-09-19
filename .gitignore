@@ -1,3 +1,6 @@
+build-puget-voice-macos-arm64/
+
+
 # Ignore editor artefacts
 /.dir-locals.el
 
