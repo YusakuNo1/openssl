@@ -101,6 +101,11 @@ static void ch_record_state_transition(QUIC_CHANNEL *ch, uint32_t new_state);
 
 DEFINE_LHASH_OF_EX(QUIC_SRT_ELEM);
 
+typedef struct cfq_data_retire_cid {
+    uint64_t rtcid_seq;
+    QUIC_CHANNEL *rtcid_ch;
+} CFQ_DATA_RETIRE_CID_T;
+
 QUIC_NEEDS_LOCK
 static QLOG *ch_get_qlog(QUIC_CHANNEL *ch)
 {
@@ -247,7 +252,7 @@ static int ch_init(QUIC_CHANNEL *ch)
     if (!ossl_quic_stream_map_init(&ch->qsm, get_stream_limit, ch,
             &ch->max_streams_bidi_rxfc,
             &ch->max_streams_uni_rxfc,
-            ch->is_server))
+            ch))
         goto err;
 
     ch->have_qsm = 1;
@@ -332,8 +337,12 @@ static int ch_init(QUIC_CHANNEL *ch)
             goto err;
     }
 
+    ch->rsqp = ossl_quic_rstream_qparm_new(ch);
+    if (ch->rsqp == NULL)
+        goto err;
+
     for (pn_space = QUIC_PN_SPACE_INITIAL; pn_space < QUIC_PN_SPACE_NUM; ++pn_space) {
-        ch->crypto_recv[pn_space] = ossl_quic_rstream_new(NULL, NULL, 0);
+        ch->crypto_recv[pn_space] = ossl_quic_rstream_new(NULL, NULL, ch->rsqp);
         if (ch->crypto_recv[pn_space] == NULL)
             goto err;
     }
@@ -395,8 +404,12 @@ static void ch_cleanup(QUIC_CHANNEL *ch)
             ++pn_space)
             ossl_ackm_on_pkt_space_discarded(ch->ackm, pn_space);
 
-    ossl_quic_lcidm_cull(ch->lcidm, ch);
-    ossl_quic_srtm_cull(ch->srtm, ch);
+    if (ch->lcidm != NULL)
+        ossl_quic_lcidm_cull(ch->lcidm, ch);
+
+    if (ch->srtm != NULL)
+        ossl_quic_srtm_cull(ch->srtm, ch);
+
     ossl_quic_tx_packetiser_free(ch->txp);
     ossl_quic_txpim_free(ch->txpim);
     ossl_quic_cfq_free(ch->cfq);
@@ -414,6 +427,9 @@ static void ch_cleanup(QUIC_CHANNEL *ch)
         ossl_quic_sstream_free(ch->crypto_send[pn_space]);
         ossl_quic_rstream_free(ch->crypto_recv[pn_space]);
     }
+
+    ossl_quic_rstream_qparm_destroy(ch->rsqp);
+    ch->rsqp = NULL;
 
     ossl_qrx_pkt_release(ch->qrx_pkt);
     ch->qrx_pkt = NULL;
@@ -644,6 +660,43 @@ int ossl_quic_channel_is_term_any(const QUIC_CHANNEL *ch)
 {
     return ossl_quic_channel_is_terminating(ch)
         || ossl_quic_channel_is_terminated(ch);
+}
+
+int ossl_quic_channel_is_server(const QUIC_CHANNEL *ch)
+{
+    return ch->is_server;
+}
+
+void ossl_quic_channel_notify_flush_done(QUIC_CHANNEL *ch)
+{
+    ch_record_state_transition(ch, ch->terminate_cause.remote ? QUIC_CHANNEL_STATE_TERMINATING_DRAINING : QUIC_CHANNEL_STATE_TERMINATING_CLOSING);
+    /*
+     * RFC 9000 s. 10.2 Immediate Close
+     *  These states SHOULD persist for at least three times
+     *  the current PTO interval as defined in [QUIC-RECOVERY].
+     */
+    ch->terminate_deadline
+        = ossl_time_add(get_time(ch),
+            ossl_time_multiply(ossl_ackm_get_pto_duration(ch->ackm), 3));
+    if (!ch->terminate_cause.remote) {
+        OSSL_QUIC_FRAME_CONN_CLOSE f = { 0 };
+
+        /* best effort */
+        f.error_code = ch->terminate_cause.error_code;
+        f.frame_type = ch->terminate_cause.frame_type;
+        f.is_app = ch->terminate_cause.app;
+        f.reason = (char *)ch->terminate_cause.reason;
+        f.reason_len = ch->terminate_cause.reason_len;
+        ossl_quic_tx_packetiser_schedule_conn_close(ch->txp, &f);
+        /*
+         * RFC 9000 s. 10.2.2 Draining Connection State:
+         *  An endpoint that receives a CONNECTION_CLOSE frame MAY
+         *  send a single packet containing a CONNECTION_CLOSE
+         *  frame before entering the draining state, using a
+         *  NO_ERROR code if appropriate
+         */
+        ch->conn_close_queued = 1;
+    }
 }
 
 const QUIC_TERMINATE_CAUSE *
@@ -1328,6 +1381,11 @@ static int ch_on_transport_params(const unsigned char *params,
     QUIC_PREFERRED_ADDR pfa;
     SSL_CONNECTION *sc = SSL_CONNECTION_FROM_SSL(ch->tls);
 
+    if (sc == NULL) {
+        ossl_quic_channel_raise_protocol_error(ch, OSSL_QUIC_ERR_INTERNAL_ERROR, 0,
+            "could not get ssl connection");
+        return 0;
+    }
     /*
      * When HRR happens the client sends the transport params in the new client
      * hello again. Reset the transport params here and load them again.
@@ -3098,13 +3156,16 @@ int ossl_quic_channel_on_handshake_confirmed(QUIC_CHANNEL *ch)
 static void copy_tcause(QUIC_TERMINATE_CAUSE *dst,
     const QUIC_TERMINATE_CAUSE *src)
 {
+    /*
+     * do not override reason once it got set.
+     */
+    if (dst->reason != NULL)
+        return;
+
     dst->error_code = src->error_code;
     dst->frame_type = src->frame_type;
     dst->app = src->app;
     dst->remote = src->remote;
-
-    dst->reason = NULL;
-    dst->reason_len = 0;
 
     if (src->reason != NULL && src->reason_len > 0) {
         size_t l = src->reason_len;
@@ -3124,6 +3185,18 @@ static void copy_tcause(QUIC_TERMINATE_CAUSE *dst,
         r[l] = '\0';
         dst->reason_len = l;
     }
+}
+
+void ossl_quic_channel_set_tcause(QUIC_CHANNEL *ch, uint64_t app_error_code,
+    const char *app_reason)
+{
+    QUIC_TERMINATE_CAUSE tcause = { 0 };
+
+    tcause.app = 1;
+    tcause.error_code = app_error_code;
+    tcause.reason = app_reason;
+    tcause.reason_len = app_reason != NULL ? strlen(app_reason) : 0;
+    copy_tcause(&ch->terminate_cause, &tcause);
 }
 
 static void ch_start_terminating(QUIC_CHANNEL *ch,
@@ -3147,36 +3220,7 @@ static void ch_start_terminating(QUIC_CHANNEL *ch,
         ossl_qlog_event_connectivity_connection_closed(ch_get_qlog(ch), tcause);
 
         if (!force_immediate) {
-            ch_record_state_transition(ch, tcause->remote ? QUIC_CHANNEL_STATE_TERMINATING_DRAINING : QUIC_CHANNEL_STATE_TERMINATING_CLOSING);
-            /*
-             * RFC 9000 s. 10.2 Immediate Close
-             *  These states SHOULD persist for at least three times
-             *  the current PTO interval as defined in [QUIC-RECOVERY].
-             */
-            ch->terminate_deadline
-                = ossl_time_add(get_time(ch),
-                    ossl_time_multiply(ossl_ackm_get_pto_duration(ch->ackm),
-                        3));
-
-            if (!tcause->remote) {
-                OSSL_QUIC_FRAME_CONN_CLOSE f = { 0 };
-
-                /* best effort */
-                f.error_code = ch->terminate_cause.error_code;
-                f.frame_type = ch->terminate_cause.frame_type;
-                f.is_app = ch->terminate_cause.app;
-                f.reason = (char *)ch->terminate_cause.reason;
-                f.reason_len = ch->terminate_cause.reason_len;
-                ossl_quic_tx_packetiser_schedule_conn_close(ch->txp, &f);
-                /*
-                 * RFC 9000 s. 10.2.2 Draining Connection State:
-                 *  An endpoint that receives a CONNECTION_CLOSE frame MAY
-                 *  send a single packet containing a CONNECTION_CLOSE
-                 *  frame before entering the draining state, using a
-                 *  NO_ERROR code if appropriate
-                 */
-                ch->conn_close_queued = 1;
-            }
+            ossl_quic_channel_notify_flush_done(ch);
         } else {
             ch_on_terminating_timeout(ch);
         }
@@ -3230,18 +3274,32 @@ void ossl_quic_channel_on_remote_conn_close(QUIC_CHANNEL *ch,
     ch_start_terminating(ch, &tcause, 0);
 }
 
-static void free_frame_data(unsigned char *buf, size_t buf_len, void *arg)
+static void free_frame_rtcid(unsigned char *buf, size_t buf_len, void *arg)
 {
+    CFQ_DATA_RETIRE_CID_T *cfq_data_rtcid = (CFQ_DATA_RETIRE_CID_T *)arg;
+    QUIC_CHANNEL *ch = cfq_data_rtcid->rtcid_ch;
+
+    if (ch->cur_retire_prior_to < cfq_data_rtcid->rtcid_seq)
+        ch->cur_retire_prior_to = cfq_data_rtcid->rtcid_seq;
+
     OPENSSL_free(buf);
+    OPENSSL_free(cfq_data_rtcid);
 }
 
 static int ch_enqueue_retire_conn_id(QUIC_CHANNEL *ch, uint64_t seq_num)
 {
+    CFQ_DATA_RETIRE_CID_T *cfq_data_rtcid = NULL;
     BUF_MEM *buf_mem = NULL;
     WPACKET wpkt;
     size_t l;
 
     ossl_quic_srtm_remove(ch->srtm, ch, seq_num);
+
+    cfq_data_rtcid = OPENSSL_malloc(sizeof(CFQ_DATA_RETIRE_CID_T));
+    if (cfq_data_rtcid == NULL)
+        goto err;
+    cfq_data_rtcid->rtcid_seq = seq_num;
+    cfq_data_rtcid->rtcid_ch = ch;
 
     if ((buf_mem = BUF_MEM_new()) == NULL)
         goto err;
@@ -3261,7 +3319,7 @@ static int ch_enqueue_retire_conn_id(QUIC_CHANNEL *ch, uint64_t seq_num)
     if (ossl_quic_cfq_add_frame(ch->cfq, 1, QUIC_PN_SPACE_APP,
             OSSL_QUIC_FRAME_TYPE_RETIRE_CONN_ID, 0,
             (unsigned char *)buf_mem->data, l,
-            free_frame_data, NULL)
+            free_frame_rtcid, cfq_data_rtcid)
         == NULL)
         goto err;
 
@@ -3275,6 +3333,7 @@ err:
         OSSL_QUIC_FRAME_TYPE_NEW_CONN_ID,
         "internal error enqueueing retire conn id");
     BUF_MEM_free(buf_mem);
+    OPENSSL_free(cfq_data_rtcid);
     return 0;
 }
 
@@ -3283,6 +3342,7 @@ void ossl_quic_channel_on_new_conn_id(QUIC_CHANNEL *ch,
 {
     uint64_t new_remote_seq_num = ch->cur_remote_seq_num;
     uint64_t new_retire_prior_to = ch->cur_retire_prior_to;
+    uint64_t retire_prior_to;
 
     if (!ossl_quic_channel_is_active(ch))
         return;
@@ -3381,10 +3441,10 @@ void ossl_quic_channel_on_new_conn_id(QUIC_CHANNEL *ch,
      * that NEW_CONNECTION_ID frame, by definition this will always be met.
      * This may change in future when we change our CID handling.
      */
-    while (new_retire_prior_to > ch->cur_retire_prior_to) {
-        if (!ch_enqueue_retire_conn_id(ch, ch->cur_retire_prior_to))
-            break;
-        ++ch->cur_retire_prior_to;
+    retire_prior_to = ch->cur_retire_prior_to;
+    while (new_retire_prior_to > retire_prior_to) {
+        ch_enqueue_retire_conn_id(ch, retire_prior_to);
+        retire_prior_to++;
     }
 }
 
@@ -3753,7 +3813,7 @@ static int ch_init_new_stream(QUIC_CHANNEL *ch, QUIC_STREAM *qs,
             goto err;
 
     if (can_recv)
-        if ((qs->rstream = ossl_quic_rstream_new(NULL, NULL, 0)) == NULL)
+        if ((qs->rstream = ossl_quic_rstream_new(NULL, NULL, ch->rsqp)) == NULL)
             goto err;
 
     /* TXFC */
@@ -3938,12 +3998,23 @@ void ossl_quic_channel_set_incoming_stream_auto_reject(QUIC_CHANNEL *ch,
 
 void ossl_quic_channel_reject_stream(QUIC_CHANNEL *ch, QUIC_STREAM *qs)
 {
+    OSSL_RTT_INFO rtt_info;
+
     ossl_quic_stream_map_stop_sending_recv_part(&ch->qsm, qs,
         ch->incoming_stream_auto_reject_aec);
 
     ossl_quic_stream_map_reset_stream_send_part(&ch->qsm, qs,
         ch->incoming_stream_auto_reject_aec);
     qs->deleted = 1;
+
+    /*
+     * A rejected stream is never placed on the accept queue, so it would
+     * otherwise never be retired and would consume the peer's stream credit
+     * for the lifetime of the connection.
+     */
+    ossl_statm_get_rtt_info(ossl_quic_channel_get_statm(ch), &rtt_info);
+    ossl_quic_stream_map_retire_stream_credit(&ch->qsm, qs,
+        rtt_info.smoothed_rtt);
 
     ossl_quic_stream_map_update_state(&ch->qsm, qs);
 }

@@ -7,10 +7,16 @@
 
 name: Backports CI
 
-on: [pull_request]
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
+
+concurrency:
+  group: backports-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   check_backports:
@@ -19,6 +25,9 @@ jobs:
       matrix:
         release: [
           {
+            branch: '4.1',
+            cppflags: ''
+          }, {
             branch: '4.0',
             cppflags: ''
           }, {
@@ -30,9 +39,6 @@ jobs:
           }, {
             branch: '3.4',
             cppflags: 'CPPFLAGS=-ansi'
-          }, {
-            branch: '3.0',
-            cppflags: 'CPPFLAGS=-ansi'
           }
         ]
     runs-on: ubuntu-latest
@@ -42,7 +48,6 @@ jobs:
       with:
         ref: ${{ github.event.pull_request.head.sha }}
         fetch-depth: 0
-        persist-credentials: false
     - name: cherry-pick
       if: ${{ contains(join(github.event.pull_request.labels.*.name,','),matrix.release.branch) }}
       run: |

@@ -7,7 +7,9 @@
 
 name: Cross Compile
 
-on: [pull_request, push]
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
@@ -117,7 +119,7 @@ jobs:
           }, {
             arch: s390x-linux-gnu,
             libs: libc6-dev-s390x-cross,
-            target: linux64-s390x -Wno-stringop-overflow,
+            target: linux64-s390x,
             fips: no
           }, {
             arch: sh4-linux-gnu,
@@ -181,13 +183,13 @@ jobs:
     - name: config with FIPS
       if: matrix.platform.fips != 'no'
       run: |
-        ./config --banner=Configured --strict-warnings enable-fips \
+        ./config --banner=Configured --strict-warnings enable-fips enable-lms \
                  --cross-compile-prefix=${{ matrix.platform.arch }}- \
                  ${{ matrix.platform.target }}
     - name: config without FIPS
       if: matrix.platform.fips == 'no'
       run: |
-        ./config --banner=Configured --strict-warnings \
+        ./config --banner=Configured --strict-warnings enable-lms \
                  --cross-compile-prefix=${{ matrix.platform.arch }}- \
                  ${{ matrix.platform.target }}
     - name: config dump

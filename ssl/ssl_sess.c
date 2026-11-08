@@ -23,7 +23,7 @@
 
 static void SSL_SESSION_list_remove(SSL_CTX *ctx, SSL_SESSION *s);
 static void SSL_SESSION_list_add(SSL_CTX *ctx, SSL_SESSION *s);
-static int remove_session_lock(SSL_CTX *ctx, SSL_SESSION *c, int lck);
+static SSL_SESSION *remove_session_locked(SSL_CTX *ctx, SSL_SESSION *c);
 
 DEFINE_STACK_OF(SSL_SESSION)
 
@@ -525,7 +525,7 @@ SSL_SESSION *lookup_sess_in_cache(SSL_CONNECTION *s,
         int copy = 1;
 
         ret = s->session_ctx->get_session_cb(SSL_CONNECTION_GET_USER_SSL(s),
-            sess_id, sess_id_len, &copy);
+            sess_id, (int)sess_id_len, &copy);
 
         if (ret != NULL) {
             if (ret->not_resumable) {
@@ -695,6 +695,32 @@ int ssl_get_prev_session(SSL_CONNECTION *s, CLIENTHELLO_MSG *hello)
         s->session = ret;
     }
 
+    /*
+     * Explicit comparison between the session ID the client offered in
+     * ClientHello and the session ID embedded in the SSL_SESSION returned by
+     * the external cache. If they do not match, the cached session is released
+     * and ssl_get_prev_session() returns as a cache miss, forcing a full
+     * handshake. The check is placed in ssl_get_prev_session() rather than a
+     * later callback because this is the earliest point where both values are
+     * available simultaneously, before any ServerHello is composed.
+     * Catching the mismatch here ensures the server never sends a ServerHello
+     * that claims resumption of a session ID it cannot legitimately echo.
+     *
+     * A mismatch unambiguously indicates one of:
+     *   - a corrupt cache entry
+     *   - an external cache implementation that returned the wrong session
+     *   - an active tampering attempt
+     *
+     * Refusing resumption and falling back to a full handshake is the correct
+     * response.
+     */
+    if (!SSL_CONNECTION_IS_TLS13(s) && hello->session_id_len > 0
+        && (s->session->session_id_length != hello->session_id_len
+            || memcmp(s->session->session_id, hello->session_id,
+                   hello->session_id_len)
+                != 0)) {
+        return 0;
+    }
     ssl_tsan_counter(s->session_ctx, &s->session_ctx->stats.sess_hit);
     s->verify_result = s->session->verify_result;
     return 1;
@@ -774,6 +800,14 @@ int SSL_CTX_add_session(SSL_CTX *ctx, SSL_SESSION *c)
         ssl_session_calculate_timeout(c);
     }
 
+    /*
+     * evicted_head is a singly-linked list (via the next pointer, which
+     * SSL_SESSION_list_remove zeroes out) of sessions evicted from the cache
+     * that need their remove_session_cb called and their reference dropped
+     * once the lock is released.
+     */
+    SSL_SESSION *evicted_head = NULL;
+
     if (s == NULL) {
         /*
          * new cache entry -- remove old ones if cache has become too large
@@ -784,10 +818,13 @@ int SSL_CTX_add_session(SSL_CTX *ctx, SSL_SESSION *c)
 
         if (SSL_CTX_sess_get_cache_size(ctx) > 0) {
             while (SSL_CTX_sess_number(ctx) >= SSL_CTX_sess_get_cache_size(ctx)) {
-                if (!remove_session_lock(ctx, ctx->session_cache_tail, 0))
+                SSL_SESSION *r = remove_session_locked(ctx, ctx->session_cache_tail);
+
+                if (r == NULL)
                     break;
-                else
-                    ssl_tsan_counter(ctx, &ctx->stats.sess_cache_full);
+                ssl_tsan_counter(ctx, &ctx->stats.sess_cache_full);
+                r->next = evicted_head;
+                evicted_head = r;
             }
         }
 
@@ -804,41 +841,59 @@ int SSL_CTX_add_session(SSL_CTX *ctx, SSL_SESSION *c)
         ret = 0;
     }
     CRYPTO_THREAD_unlock(ctx->lock);
+
+    while (evicted_head != NULL) {
+        SSL_SESSION *next = evicted_head->next;
+
+        evicted_head->next = NULL;
+        if (ctx->remove_session_cb != NULL)
+            ctx->remove_session_cb(ctx, evicted_head);
+        SSL_SESSION_free(evicted_head);
+        evicted_head = next;
+    }
+
     return ret;
 }
 
 int SSL_CTX_remove_session(SSL_CTX *ctx, SSL_SESSION *c)
 {
-    return remove_session_lock(ctx, c, 1);
+    SSL_SESSION *r;
+
+    if (c == NULL || c->session_id_length == 0)
+        return 0;
+    if (!CRYPTO_THREAD_write_lock(ctx->lock))
+        return 0;
+    r = remove_session_locked(ctx, c);
+    CRYPTO_THREAD_unlock(ctx->lock);
+
+    /*
+     * The callback is invoked even when the session is not in the internal
+     * cache so that external caches can be notified.
+     */
+    if (ctx->remove_session_cb != NULL)
+        ctx->remove_session_cb(ctx, c);
+    SSL_SESSION_free(r);
+    return r != NULL;
 }
 
-static int remove_session_lock(SSL_CTX *ctx, SSL_SESSION *c, int lck)
+/*
+ * Removes c from the session cache. Caller must hold ctx->lock.
+ * Returns the removed session (caller must invoke remove_session_cb and
+ * SSL_SESSION_free), or NULL if not found.
+ */
+static SSL_SESSION *remove_session_locked(SSL_CTX *ctx, SSL_SESSION *c)
 {
-    SSL_SESSION *r;
-    int ret = 0;
+    SSL_SESSION *r = NULL;
 
-    if ((c != NULL) && (c->session_id_length != 0)) {
-        if (lck) {
-            if (!CRYPTO_THREAD_write_lock(ctx->lock))
-                return 0;
-        }
-        if ((r = lh_SSL_SESSION_retrieve(ctx->sessions, c)) != NULL) {
-            ret = 1;
+    if (c != NULL && c->session_id_length != 0) {
+        r = lh_SSL_SESSION_retrieve(ctx->sessions, c);
+        if (r != NULL) {
             r = lh_SSL_SESSION_delete(ctx->sessions, r);
             SSL_SESSION_list_remove(ctx, r);
         }
         c->not_resumable = 1;
-
-        if (lck)
-            CRYPTO_THREAD_unlock(ctx->lock);
-
-        if (ctx->remove_session_cb != NULL)
-            ctx->remove_session_cb(ctx, c);
-
-        if (ret)
-            SSL_SESSION_free(r);
     }
-    return ret;
+    return r;
 }
 
 void SSL_SESSION_free(SSL_SESSION *ss)
@@ -1224,9 +1279,10 @@ void SSL_CTX_flush_sessions_ex(SSL_CTX *s, time_t t)
     /*
      * Iterate over the list from the back (oldest), and stop
      * when a session can no longer be removed.
-     * Add the session to a temporary list to be freed outside
-     * the SSL_CTX lock.
-     * But still do the remove_session_cb() within the lock.
+     * Collect removed sessions on a stack to be processed outside the lock,
+     * so that remove_session_cb is never invoked while holding ctx->lock.
+     * If the stack failed to create, or a push fails, free the session
+     * immediately (without invoking the callback).
      */
     while (s->session_cache_tail != NULL) {
         current = s->session_cache_tail;
@@ -1234,15 +1290,6 @@ void SSL_CTX_flush_sessions_ex(SSL_CTX *s, time_t t)
             lh_SSL_SESSION_delete(s->sessions, current);
             SSL_SESSION_list_remove(s, current);
             current->not_resumable = 1;
-            if (s->remove_session_cb != NULL)
-                s->remove_session_cb(s, current);
-            /*
-             * Throw the session on a stack, it's entirely plausible
-             * that while freeing outside the critical section, the
-             * session could be re-added, so avoid using the next/prev
-             * pointers. If the stack failed to create, or the session
-             * couldn't be put on the stack, just free it here
-             */
             if (sk == NULL || !sk_SSL_SESSION_push(sk, current))
                 SSL_SESSION_free(current);
         } else {
@@ -1253,7 +1300,13 @@ void SSL_CTX_flush_sessions_ex(SSL_CTX *s, time_t t)
     lh_SSL_SESSION_set_down_load(s->sessions, i);
     CRYPTO_THREAD_unlock(s->lock);
 
-    sk_SSL_SESSION_pop_free(sk, SSL_SESSION_free);
+    while (sk_SSL_SESSION_num(sk) > 0) {
+        current = sk_SSL_SESSION_pop(sk);
+        if (s->remove_session_cb != NULL)
+            s->remove_session_cb(s, current);
+        SSL_SESSION_free(current);
+    }
+    sk_SSL_SESSION_free(sk);
 }
 
 int ssl_clear_bad_session(SSL_CONNECTION *s)

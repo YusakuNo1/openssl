@@ -11,6 +11,8 @@
 #include "internal/quic_statm.h"
 #include "internal/quic_demux.h"
 #include "internal/quic_record_rx.h"
+#include "internal/quic_channel.h"
+#include "../ssl/quic/quic_channel_local.h"
 #include "testutil.h"
 #include "quic_record_test_util.h"
 
@@ -74,6 +76,7 @@ struct helper {
         OSSL_QUIC_FRAME_CONN_CLOSE conn_close;
     } frame;
     OSSL_QUIC_ACK_RANGE ack_ranges[16];
+    QUIC_CHANNEL *client_ch;
 };
 
 static void helper_cleanup(struct helper *h)
@@ -106,6 +109,7 @@ static void helper_cleanup(struct helper *h)
     ossl_quic_demux_free(h->demux);
     BIO_free(h->bio1);
     BIO_free(h->bio2);
+    ossl_quic_channel_free(h->client_ch);
 }
 
 static void demux_default_handler(QUIC_URXE *e, void *arg,
@@ -123,8 +127,10 @@ static int helper_init(struct helper *h)
 {
     int rc = 0;
     size_t i;
+    QUIC_CHANNEL_ARGS client_ch_args;
 
     memset(h, 0, sizeof(*h));
+    memset(&client_ch_args, 0, sizeof(client_ch_args));
 
     /* Initialisation */
     if (!TEST_true(BIO_new_bio_dgram_pair(&h->bio1, 0, &h->bio2, 0)))
@@ -186,10 +192,13 @@ static int helper_init(struct helper *h)
                       /* is_server */ 0)))
         goto err;
 
+    h->client_ch = ossl_quic_channel_alloc(&client_ch_args);
+    if (!TEST_ptr(h->client_ch))
+        goto err;
     if (!TEST_true(ossl_quic_stream_map_init(&h->qsm, NULL, NULL,
             &h->max_streams_bidi_rxfc,
             &h->max_streams_uni_rxfc,
-            /*is_server=*/0)))
+            h->client_ch)))
         goto err;
 
     h->have_qsm = 1;
@@ -1303,8 +1312,16 @@ static int run_script(int script_idx, const struct script_op *script)
     struct helper h;
     const struct script_op *op;
     size_t opn = 0;
+    QUIC_CHANNEL *ch = NULL;
+    QUIC_RSTREAM_QPARM *rsqp = NULL;
 
     if (!helper_init(&h))
+        goto err;
+
+    if (!TEST_ptr(ch = OPENSSL_zalloc(sizeof(QUIC_CHANNEL))))
+        goto err;
+
+    if (!TEST_ptr(rsqp = ossl_quic_rstream_qparm_new(ch)))
         goto err;
 
     have_helper = 1;
@@ -1500,7 +1517,7 @@ static int run_script(int script_idx, const struct script_op *script)
                     16 * 1024 * 1024,
                     fake_now, NULL))
                 || !TEST_ptr(s->rstream = ossl_quic_rstream_new(&s->rxfc,
-                                 NULL, 1024))) {
+                                 NULL, rsqp))) {
                 ossl_quic_sstream_free(s->sstream);
                 ossl_quic_stream_map_release(h.args.qsm, s);
                 goto err;
@@ -1598,6 +1615,8 @@ err:
         TEST_error("script %d failed at op %zu", script_idx + 1, opn + 1);
     if (have_helper)
         helper_cleanup(&h);
+    ossl_quic_rstream_qparm_destroy(rsqp);
+    ossl_quic_channel_free(ch);
     return testresult;
 }
 
@@ -1691,7 +1710,7 @@ int setup_tests(void)
 {
     ADD_ALL_TESTS(test_script, OSSL_NELEM(scripts));
     ADD_ALL_TESTS(test_dyn_script_1,
-        OSSL_NELEM(dyn_script_1_crypto_1a)
-            - dyn_script_1_start_from + 1);
+        (int)(OSSL_NELEM(dyn_script_1_crypto_1a)
+            - dyn_script_1_start_from + 1));
     return 1;
 }

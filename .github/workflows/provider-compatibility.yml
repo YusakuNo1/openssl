@@ -128,6 +128,11 @@ jobs:
             tgz: branch-3.5.tar.gz,
             extra_config: "",
           }, {
+            name: openssl-3.6,
+            dir: branch-3.6,
+            tgz: branch-3.6.tar.gz,
+            extra_config: "enable-lms",
+          }, {
             name: master,
             dir: branch-master,
             tgz: branch-master.tar.gz,
@@ -232,8 +237,8 @@ jobs:
       - name: set up cross validation of FIPS from A with tree from B
         if: steps.early_exit.outputs.skip != 'true'
         run: |
-          cp providers/fips.so ../${{ matrix.tree_b }}/providers/
-          cp providers/fipsmodule.cnf ../${{ matrix.tree_b }}/providers/
+          cp -f providers/fips.so ../${{ matrix.tree_b }}/providers/
+          cp -f providers/fipsmodule.cnf ../${{ matrix.tree_b }}/providers/
         working-directory: ${{ matrix.tree_a }}
 
       - name: show module versions from cross validation

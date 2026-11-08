@@ -1,5 +1,5 @@
 /*
- * Copyright 2019-2025 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2019-2026 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -362,6 +362,31 @@ PROV_CIPHER_HW_FN ossl_cipher_hw_chunked_ofb128;
     {                                                                    \
         return name##_known_settable_ctx_params;                         \
     }
+
+struct ossl_cipher_get_ctx_param_list_st {
+#ifdef FIPS_MODULE
+    OSSL_PARAM *ind; /* FIPS indicator */
+#endif
+    OSSL_PARAM *keylen; /* all ciphers */
+    OSSL_PARAM *ivlen; /* all ciphers */
+    OSSL_PARAM *pad; /* all ciphers */
+    OSSL_PARAM *num; /* all ciphers */
+    OSSL_PARAM *iv; /* all ciphers */
+    OSSL_PARAM *updiv; /* all ciphers */
+    OSSL_PARAM *tlsmac; /* generic cipher */
+};
+
+struct ossl_cipher_set_ctx_param_list_st {
+    OSSL_PARAM *pad; /* all ciphers */
+    OSSL_PARAM *num; /* all ciphers */
+    OSSL_PARAM *bits; /* generic cipher */
+    OSSL_PARAM *tlsvers; /* generic cipher */
+    OSSL_PARAM *tlsmacsize; /* generic cipher */
+    OSSL_PARAM *keylen; /* variable key length ciphers */
+};
+
+int ossl_cipher_common_get_ctx_params(PROV_CIPHER_CTX *ctx, const struct ossl_cipher_get_ctx_param_list_st *p);
+int ossl_cipher_common_set_ctx_params(PROV_CIPHER_CTX *ctx, const struct ossl_cipher_set_ctx_param_list_st *p);
 
 int ossl_cipher_generic_initiv(PROV_CIPHER_CTX *ctx, const unsigned char *iv,
     size_t ivlen);

@@ -665,7 +665,7 @@ next_io:
             if (rctx->state == OHS_WRITE_HDR1)
                 rctx->state = OHS_WRITE_HDR;
             rctx->pos += sz;
-            rctx->len_to_send -= sz;
+            rctx->len_to_send -= (long)sz;
             goto next_io;
         }
         if (rctx->state == OHS_WRITE_HDR) {
@@ -1264,7 +1264,7 @@ BIO *OSSL_HTTP_exchange(OSSL_HTTP_REQ_CTX *rctx, char **redirection_url)
     return resp;
 }
 
-static int redirection_ok(int n_redir, const char *old_url, const char *new_url)
+static int redirection_ok(int n_redir, int use_ssl, const char *new_url)
 {
     if (n_redir >= HTTP_VERSION_MAX_REDIRECTIONS) {
         ERR_raise(ERR_LIB_HTTP, HTTP_R_TOO_MANY_REDIRECTIONS);
@@ -1272,7 +1272,7 @@ static int redirection_ok(int n_redir, const char *old_url, const char *new_url)
     }
     if (*new_url == '/') /* redirection to same server => same protocol */
         return 1;
-    if (HAS_PREFIX(old_url, OSSL_HTTPS_NAME ":") && !HAS_PREFIX(new_url, OSSL_HTTPS_NAME ":")) {
+    if (use_ssl && !HAS_PREFIX(new_url, OSSL_HTTPS_NAME ":")) {
         ERR_raise(ERR_LIB_HTTP, HTTP_R_REDIRECTION_FROM_HTTPS_TO_HTTP);
         return 0;
     }
@@ -1331,7 +1331,7 @@ BIO *OSSL_HTTP_get(const char *url, const char *proxy, const char *no_proxy,
         }
         OPENSSL_free(path);
         if (resp == NULL && redirection_url != NULL) {
-            if (redirection_ok(++n_redirs, current_url, redirection_url)
+            if (redirection_ok(++n_redirs, use_ssl, redirection_url)
                 && may_still_retry(max_time, &timeout)) {
                 (void)BIO_reset(bio);
                 OPENSSL_free(current_url);
@@ -1431,6 +1431,8 @@ static char *base64encode(const void *buf, size_t len)
     size_t outl;
     char *out;
 
+    if (len > INT_MAX)
+        return 0;
     /* Calculate size of encoded data */
     outl = (len / 3);
     if (len % 3 > 0)
@@ -1440,7 +1442,7 @@ static char *base64encode(const void *buf, size_t len)
     if (out == NULL)
         return 0;
 
-    i = EVP_EncodeBlock((unsigned char *)out, buf, len);
+    i = EVP_EncodeBlock((unsigned char *)out, buf, (int)len);
     if (!ossl_assert(0 <= i && (size_t)i <= outl)) {
         OPENSSL_free(out);
         return NULL;

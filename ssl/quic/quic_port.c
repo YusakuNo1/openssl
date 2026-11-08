@@ -134,7 +134,7 @@ void ossl_quic_port_free(QUIC_PORT *port)
 static int port_init(QUIC_PORT *port)
 {
     size_t rx_short_dcid_len = (port->is_multi_conn ? INIT_DCID_LEN : 0);
-    int key_len;
+    int key_len = -1;
     EVP_CIPHER *cipher = NULL;
     unsigned char *token_key = NULL;
     int ret = 0;
@@ -181,14 +181,17 @@ static int port_init(QUIC_PORT *port)
         || !EVP_EncryptInit_ex(port->token_ctx, cipher, NULL, NULL, NULL)
         || (key_len = EVP_CIPHER_CTX_get_key_length(port->token_ctx)) <= 0
         || (token_key = OPENSSL_malloc(key_len)) == NULL
-        || !RAND_bytes_ex(port->engine->libctx, token_key, key_len, 0)
+        || !RAND_priv_bytes_ex(port->engine->libctx, token_key, key_len, 0)
         || !EVP_EncryptInit_ex(port->token_ctx, NULL, NULL, token_key, NULL))
         goto err;
 
     ret = 1;
 err:
     EVP_CIPHER_free(cipher);
-    OPENSSL_free(token_key);
+    if (key_len >= 1)
+        OPENSSL_clear_free(token_key, key_len);
+    else
+        OPENSSL_free(token_key);
     if (!ret)
         port_cleanup(port);
     return ret;
@@ -439,8 +442,8 @@ int ossl_quic_port_set_net_wbio(QUIC_PORT *port, BIO *net_wbio)
     if (!port_update_poll_desc(port, net_wbio, /*for_write=*/1))
         return 0;
 
-    OSSL_LIST_FOREACH(ch, ch, &port->channel_list)
-    ossl_qtx_set_bio(ch->qtx, net_wbio);
+    OSSL_LIST_FOREACH (ch, ch, &port->channel_list)
+        ossl_qtx_set_bio(ch->qtx, net_wbio);
 
     port->net_wbio = net_wbio;
     port_update_addressing_mode(port);
@@ -680,8 +683,7 @@ void ossl_quic_port_subtick(QUIC_PORT *port, QUIC_TICK_RESULT *res,
             port_rx_pre(port);
 
         /* Iterate through all channels and service them. */
-        OSSL_LIST_FOREACH(ch, ch, &port->channel_list)
-        {
+        OSSL_LIST_FOREACH (ch, ch, &port->channel_list) {
             QUIC_TICK_RESULT subr = { 0 };
 
             ossl_quic_channel_subtick(ch, &subr, flags);
@@ -956,10 +958,10 @@ static int encrypt_validation_token(const QUIC_PORT *port,
     size_t *ct_len)
 {
     int iv_len, len, ret = 0;
-    size_t tag_len;
+    int tag_len;
     unsigned char *iv = ciphertext, *data, *tag;
 
-    if ((tag_len = EVP_CIPHER_CTX_get_tag_length(port->token_ctx)) == 0
+    if ((tag_len = EVP_CIPHER_CTX_get_tag_length(port->token_ctx)) <= 0
         || (iv_len = EVP_CIPHER_CTX_get_iv_length(port->token_ctx)) <= 0)
         goto err;
 
@@ -974,7 +976,7 @@ static int encrypt_validation_token(const QUIC_PORT *port,
 
     if (!RAND_bytes_ex(port->engine->libctx, ciphertext, iv_len, 0)
         || !EVP_EncryptInit_ex(port->token_ctx, NULL, NULL, NULL, iv)
-        || !EVP_EncryptUpdate(port->token_ctx, data, &len, plaintext, pt_len)
+        || !EVP_EncryptUpdate(port->token_ctx, data, &len, plaintext, (int)pt_len)
         || !EVP_EncryptFinal_ex(port->token_ctx, data + pt_len, &len)
         || !EVP_CIPHER_CTX_ctrl(port->token_ctx, EVP_CTRL_GCM_GET_TAG, tag_len, tag))
         goto err;
@@ -1006,15 +1008,15 @@ static int decrypt_validation_token(const QUIC_PORT *port,
     size_t *pt_len)
 {
     int iv_len, len = 0, ret = 0;
-    size_t tag_len;
+    int tag_len;
     const unsigned char *iv = ciphertext, *data, *tag;
 
-    if ((tag_len = EVP_CIPHER_CTX_get_tag_length(port->token_ctx)) == 0
+    if ((tag_len = EVP_CIPHER_CTX_get_tag_length(port->token_ctx)) <= 0
         || (iv_len = EVP_CIPHER_CTX_get_iv_length(port->token_ctx)) <= 0)
         goto err;
 
     /* Prevent decryption of a buffer that is not within reasonable bounds */
-    if (ct_len < (iv_len + tag_len) || ct_len > ENCRYPTED_TOKEN_MAX_LEN)
+    if (ct_len < (size_t)(iv_len + tag_len) || ct_len > ENCRYPTED_TOKEN_MAX_LEN)
         goto err;
 
     *pt_len = ct_len - iv_len - tag_len;
@@ -1028,7 +1030,7 @@ static int decrypt_validation_token(const QUIC_PORT *port,
 
     if (!EVP_DecryptInit_ex(port->token_ctx, NULL, NULL, NULL, iv)
         || !EVP_DecryptUpdate(port->token_ctx, plaintext, &len, data,
-            ct_len - iv_len - tag_len)
+            (int)(ct_len - iv_len - tag_len))
         || !EVP_CIPHER_CTX_ctrl(port->token_ctx, EVP_CTRL_GCM_SET_TAG, tag_len,
             (void *)tag)
         || !EVP_DecryptFinal_ex(port->token_ctx, plaintext + len, &len))
@@ -1122,7 +1124,7 @@ static void port_send_retry(QUIC_PORT *port,
      */
     unsigned char buffer[512];
     unsigned char ct_buf[ENCRYPTED_TOKEN_MAX_LEN];
-    WPACKET wpkt;
+    WPACKET wpkt = { 0 };
     size_t written, token_buf_len, ct_len;
     QUIC_PKT_HDR hdr = { 0 };
     QUIC_VALIDATION_TOKEN token = { 0 };
@@ -1208,6 +1210,7 @@ static void port_send_retry(QUIC_PORT *port,
             "port retry send failed due to network BIO I/O error");
 
 err:
+    WPACKET_cleanup(&wpkt);
     cleanup_validation_token(&token);
 }
 
@@ -1274,21 +1277,21 @@ static void port_send_version_negotiation(QUIC_PORT *port, BIO_ADDR *peer,
 
     if (!ossl_quic_wire_encode_pkt_hdr(&wpkt, client_hdr->dst_conn_id.id_len,
             &hdr, NULL))
-        return;
+        goto err;
 
     /*
      * Add the array of supported versions to the end of the packet
      */
     for (i = 0; i < OSSL_NELEM(supported_versions); i++) {
         if (!WPACKET_put_bytes_u32(&wpkt, supported_versions[i]))
-            return;
+            goto err;
     }
 
     if (!WPACKET_get_total_written(&wpkt, &msg[0].data_len))
-        return;
+        goto err;
 
     if (!WPACKET_finish(&wpkt))
-        return;
+        goto err;
 
     /*
      * Send it back to the client attempting to connect
@@ -1298,6 +1301,10 @@ static void port_send_version_negotiation(QUIC_PORT *port, BIO_ADDR *peer,
     if (!BIO_sendmmsg(port->net_wbio, msg, sizeof(BIO_MSG), 1, 0, &written))
         ERR_raise_data(ERR_LIB_SSL, SSL_R_QUIC_NETWORK_ERROR,
             "port version negotiation send failed");
+    return;
+err:
+    WPACKET_cleanup(&wpkt);
+    return;
 }
 
 /**
@@ -1510,6 +1517,7 @@ static void port_default_packet_handler(QUIC_URXE *e, void *arg,
         && ossl_quic_lcidm_lookup(port->lcidm, dcid, NULL,
             (void **)&ch)) {
         assert(ch != NULL);
+        ossl_quic_tx_packetiser_add_unvalidated_credit(ch->txp, e->data_len);
         ossl_quic_channel_inject(ch, e);
         return;
     }
@@ -1721,6 +1729,7 @@ static void port_default_packet_handler(QUIC_URXE *e, void *arg,
          * Time to reinject packets from qrx to channel before
          * qrx will be destroyed here.
          */
+        ossl_quic_tx_packetiser_add_unvalidated_credit(new_ch->txp, e->data_len);
         while (ossl_qrx_read_pkt(qrx_src, &qrx_pkt) == 1)
             ossl_quic_channel_inject_pkt(new_ch, qrx_pkt);
         ossl_qrx_update_pn_space(qrx_src, new_ch->qrx);
@@ -1772,9 +1781,9 @@ void ossl_quic_port_raise_net_error(QUIC_PORT *port,
     if (triggering_ch != NULL)
         ossl_quic_channel_raise_net_error(triggering_ch);
 
-    OSSL_LIST_FOREACH(ch, ch, &port->channel_list)
-    if (ch != triggering_ch)
-        ossl_quic_channel_raise_net_error(ch);
+    OSSL_LIST_FOREACH (ch, ch, &port->channel_list)
+        if (ch != triggering_ch)
+            ossl_quic_channel_raise_net_error(ch);
 }
 
 void ossl_quic_port_restore_err_state(const QUIC_PORT *port)

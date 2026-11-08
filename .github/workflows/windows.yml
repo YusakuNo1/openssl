@@ -20,15 +20,15 @@ jobs:
         platform:
           - arch: amd64
             os: windows-2022
-            config: enable-fips
+            config: enable-lms enable-fips
             vcvars: C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat
           - arch: amd64
             os: windows-2025
-            config: enable-fips no-thread-pool no-quic
+            config: enable-lms enable-fips no-thread-pool no-quic
             vcvars: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat
           - arch: x86
             os: windows-2022
-            config: no-fips
+            config: no-fips enable-lms
             vcvars: C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars32.bat
     runs-on: ${{ matrix.platform.os }}
     steps:
@@ -48,7 +48,7 @@ jobs:
       shell: cmd
       run: |
         call "${{ matrix.platform.vcvars }}"
-        perl ..\Configure --banner=Configured no-makedepend -DOSSL_WINCTX=openssl ${{ matrix.platform.config }}
+        perl ..\Configure --banner=Configured --strict-warnings no-makedepend -DOSSL_WINCTX=openssl ${{ matrix.platform.config }}
         perl configdata.pm --dump
     - name: build
       working-directory: _build
@@ -120,7 +120,7 @@ jobs:
       shell: cmd
       run: |
         call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-        perl ..\Configure --banner=Configured enable-demos no-makedepend no-shared no-fips enable-md2 enable-rc5 enable-ssl3 enable-ssl3-method enable-weak-ssl-ciphers enable-trace enable-crypto-mdebug -DOSSL_WINCTX=openssl VC-WIN64A-masm
+        perl ..\Configure --banner=Configured --strict-warnings enable-demos no-makedepend no-shared no-fips enable-md2 enable-rc5 enable-ssl3 enable-ssl3-method enable-weak-ssl-ciphers enable-trace enable-crypto-mdebug -DOSSL_WINCTX=openssl VC-WIN64A-masm
         perl configdata.pm --dump
     - name: build
       working-directory: _build
@@ -161,7 +161,7 @@ jobs:
       shell: cmd
       run: |
         call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-        perl ..\Configure --banner=Configured enable-demos no-makedepend no-bulk no-deprecated no-fips no-asm no-threads -DOPENSSL_SMALL_FOOTPRINT -DOSSL_WINCTX=openssl
+        perl ..\Configure --banner=Configured --strict-warnings enable-demos no-makedepend no-bulk no-deprecated no-fips no-asm no-threads -DOPENSSL_SMALL_FOOTPRINT -DOSSL_WINCTX=openssl
         perl configdata.pm --dump
     - name: build
       working-directory: _build

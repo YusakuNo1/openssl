@@ -252,7 +252,6 @@ struct bignum_st {
 
 /* Used for montgomery multiplication */
 struct bn_mont_ctx_st {
-    int ri; /* number of bits in R */
     BIGNUM RR; /* used to convert to montgomery form,
                   possibly zero-padded */
     BIGNUM N; /* The modulus */
@@ -261,6 +260,7 @@ struct bn_mont_ctx_st {
     BN_ULONG n0[2]; /* least significant word(s) of Ni; (type
                      * changed with 0.9.9, was "BN_ULONG n0;"
                      * before) */
+    int ri; /* number of bits in R */
     int flags;
 };
 
